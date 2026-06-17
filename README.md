@@ -210,3 +210,8 @@ If your endpoint supports vision, set `OPENAI_VISION_SUPPORT=true` — the agent
 - Your `WEBSIM_BEARER` JWT in `.env` is a **live login** for your websim account. Treat it like a password.
 - The agent can create, edit, publish, and delete revisions and comments. Point it only at projects you own.
 - `AGENT_MAX_TURNS` (default 15) prevents infinite tool-calling loops.
+
+### Notice
+
+This project is a HEAVY work in progress!
+Please be careful when hosting this!
