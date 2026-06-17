@@ -122,6 +122,8 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
   const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision']);
   let edited = false;
   let published = false;
+  let publishRetries = 0;
+  const MAX_PUBLISH_RETRIES = 3;
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
     const response = await callModel(messages, tools);
@@ -130,10 +132,17 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
     const toolCalls = msg.tool_calls || [];
 
     if (toolCalls.length === 0) {
-      if (edited && !published) {
-        console.log('   ⚠️ Files uploaded but NOT published — prompting to finish.');
-        messages.push({ role: 'user', content: 'You uploaded files but did NOT call finish_revision or set_current_revision. The changes are NOT live! Call finish_revision and set_current_revision NOW.' });
+      if (edited && !published && publishRetries < MAX_PUBLISH_RETRIES) {
+        publishRetries++;
+        console.log(`   ⚠️ NOT published (attempt ${publishRetries}/${MAX_PUBLISH_RETRIES}) — forcing finish_revision.`);
+        // Force the exact tool calls needed — bypass LLM indecision
+        const draftMsg = messages.filter(m => m.role === 'assistant' && m.tool_calls?.some(tc => tc.function?.name === 'create_revision')).pop();
+        let revNum = 'latest';
+        messages.push({ role: 'user', content: `CRITICAL: You have uploaded files but not published. You MUST call these tools NOW, in this exact order:\n\n1. <tool_call>finish_revision with revision=the draft revision number you created</tool_call>\n2. <tool_call>set_current_revision with revision=same number</tool_call>\n\nDO NOT download or write anything else. JUST FINISH AND PUBLISH.` });
         continue;
+      }
+      if (edited && !published && publishRetries >= MAX_PUBLISH_RETRIES) {
+        console.log('   ⚠️ Max publish retries reached — continuing anyway.');
       }
       const summary = (msg.content || '').trim();
       if (summary) console.log(summary.slice(0, 400));
@@ -272,19 +281,23 @@ async function announceQueuePositions(projectAlias, state) {
   if (state.queue.length === 0) return;
   const now = Date.now();
   const last = state.lastAnnounce ? new Date(state.lastAnnounce).getTime() : 0;
-  if (now - last < CONFIG.queueAnnounceMs) return;
+  // Only announce if enough time passed OR queue just changed (caller sets lastAnnounce=null to force)
+  if (now - last < CONFIG.queueAnnounceMs && last !== 0) return;
 
-  console.log(`   📢 Announcing queue positions (${state.queue.length} waiting)...`);
+  console.log(`   📢 Announcing queue (${state.queue.length} waiting)...`);
   const WIP = '⚠️ *Heads up — heavy work in progress!*\n\n';
 
   for (let i = 0; i < state.queue.length; i++) {
     const item = state.queue[i];
     const quote = RANDOM_QUOTES[Math.floor(Math.random() * RANDOM_QUOTES.length)];
-    const msg = `${WIP}Your spot in the generation queue: **#${i + 1}**. Please be patient!\n\n> ${quote}`;
+    const statusLine = i === 0 && state.currentlyProcessing
+      ? `**#${i + 1}** — currently being built! 🔨`
+      : `**#${i + 1}** of ${state.queue.length}`;
+    const msg = `${WIP}Your spot in the generation queue: ${statusLine}. Please be patient!\n\n> ${quote}`;
     try {
       await mcpClient.callTool({ name: 'post_reply', arguments: { project: projectAlias, comment_id: item.commentId, content: msg } });
     } catch {}
-    if (i < state.queue.length - 1) await new Promise(r => setTimeout(r, 2000)); // rate limit
+    if (i < state.queue.length - 1) await new Promise(r => setTimeout(r, 1500)); // rate limit
   }
 
   state.lastAnnounce = new Date().toISOString();
@@ -343,9 +356,10 @@ async function processNextInQueue(projectAlias, state) {
   state.currentlyProcessing = null;
   saveBotState(state);
 
-  // Immediately process next if any
+  // Immediately process next if any, and announce updated positions
   if (state.queue.length > 0) {
-    console.log(`   📋 ${state.queue.length} more in queue — processing next...`);
+    console.log(`   📋 ${state.queue.length} more in queue — updated positions sent.`);
+    await announceQueuePositions(projectAlias, state);
     await processNextInQueue(projectAlias, state);
   }
 }
@@ -401,9 +415,12 @@ async function pollAndEnqueue(projectAlias, state) {
     }
     saveBotState(state);
 
+    // Announce positions to everyone who just joined + announce if queue is non-empty
     if (newComments.length > 0) {
       const sn = selfCount > 0 ? ` (${selfCount} self skipped)` : '';
       console.log(`[${ts}] ${newComments.length} new → queue now ${state.queue.length}${sn}`);
+      // Immediately announce positions to everyone waiting
+      await announceQueuePositions(projectAlias, state);
     }
 
     // Try to process next item
