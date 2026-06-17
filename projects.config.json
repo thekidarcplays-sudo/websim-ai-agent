@@ -1,0 +1,11 @@
+{
+  "defaultProject": "opus48",
+
+  "projects": {
+    "opus48": {
+      "id": "lsfz23jfjifxomvd1_w8",
+      "slug": "@Opus_4_8/opus-4-8-adds-comments",
+      "label": "Opus 4-8 Adds Comments"
+    }
+  }
+}

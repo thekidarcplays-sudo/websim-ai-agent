@@ -1,0 +1,16 @@
+# secrets
+.env
+*.secret
+
+# dependencies
+node_modules/
+
+# project mirrors (downloaded from websim)
+project/
+
+# agent state
+comment-bot-seen.json
+
+# OS junk
+.DS_Store
+Thumbs.db

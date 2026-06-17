@@ -1,0 +1,471 @@
+#!/usr/bin/env node
+/**
+ * websim multi-project MCP server (stdio transport)
+ *
+ * Supports multiple websim projects defined in projects.config.json.
+ * Every tool accepts an optional `project` param (alias from config).
+ * If omitted, uses the configured defaultProject.
+ *
+ * v2 changes from original:
+ *   - Multi-project: tools take `project` (alias), reads config for id/slug
+ *   - Per-project bearer override (some projects may use different accounts)
+ *   - list_projects tool so agents can discover available projects
+ *   - Falls back gracefully when project alias is unknown
+ */
+
+const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
+const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
+const { z } = require('zod');
+const fs = require('fs');
+const nodePath = require('path');
+
+// ── Config loading ────────────────────────────────────────────────
+require('dotenv').config();
+
+const CONFIG_PATH = nodePath.join(__dirname, 'projects.config.json');
+let config = { projects: {}, defaultProject: null };
+
+function loadConfig() {
+  try {
+    config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  } catch (err) {
+    console.error(`[mcp] WARNING: Could not load ${CONFIG_PATH}:`, err.message);
+  }
+}
+loadConfig();
+
+function getProject(alias) {
+  const key = alias || config.defaultProject;
+  const proj = config.projects?.[key];
+  if (!proj) throw new Error(`Unknown project alias "${key}". Available: ${Object.keys(config.projects || {}).join(', ')}`);
+  return { alias: key, ...proj };
+}
+
+// Global bearer from .env; individual projects can override
+const GLOBAL_BEARER = process.env.WEBSIM_BEARER || process.env.bearer || process.env.WEBSIM_TOKEN;
+function getBearer(project) {
+  return project.bearer || GLOBAL_BEARER;
+}
+
+const API_BASE = 'https://websim.com/api/v1';
+const PROJECT_DIR = nodePath.join(__dirname, 'project');
+
+// ── Helpers ───────────────────────────────────────────────────────
+
+function authHeaders(token) {
+  return {
+    authorization: `Bearer ${token}`,
+    accept: '*/*',
+    origin: 'https://websim.com',
+  };
+}
+
+function contentTypeFor(path) {
+  const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
+  const map = {
+    html: 'text/html; charset=utf-8', css: 'text/css', js: 'text/javascript',
+    mjs: 'text/javascript', json: 'application/json', md: 'text/markdown',
+    txt: 'text/plain', svg: 'image/svg+xml', xml: 'application/xml',
+  };
+  return map[ext] || 'text/plain';
+}
+
+async function uploadAsset(projectId, revision, path, content, token, isEdit) {
+  const body = Buffer.from(content, 'utf8');
+  const meta = { size: body.length };
+  if (isEdit) meta.existingAssetPath = path;
+
+  const form = new FormData();
+  form.append('contents', JSON.stringify([meta]));
+  form.append('0', new Blob([body], { type: contentTypeFor(path) }), path);
+
+  const res = await fetch(
+    `${API_BASE}/projects/${projectId}/revisions/${revision}/assets`,
+    { method: 'POST', headers: authHeaders(token), body: form }
+  );
+  const text = await res.text();
+  if (!res.ok) throw new Error(`upload failed (${res.status}): ${text}`);
+  return text;
+}
+
+async function assetExists(projectId, revision, path, token) {
+  const res = await fetch(
+    `${API_BASE}/projects/${projectId}/revisions/${revision}/assets`,
+    { headers: authHeaders(token) }
+  );
+  if (!res.ok) return false;
+  const data = JSON.parse(await res.text());
+  return (data.assets || []).some((a) => a.path === path);
+}
+
+// ── MCP Server ────────────────────────────────────────────────────
+
+const server = new McpServer({ name: 'websim-multi-project', version: '2.0.0' });
+
+// Project param schema reused across tools
+const projectParam = z.string().optional().describe('Project alias from projects.config.json. Uses defaultProject if omitted.');
+
+// ── Local file writing (for LLM to stage edits) ────────────────────
+
+server.tool(
+  'write_file',
+  'Write content to a local file in the project mirror (project/<alias>/<path>). Call this BEFORE upload_file after editing.',
+  {
+    path: z.string().describe('File path within the project, will write to project/<alias>/<path>.'),
+    content: z.string().describe('Full new file content to write.'),
+    project: projectParam,
+  },
+  async ({ path, content, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
+    await fs.promises.mkdir(nodePath.dirname(dest), { recursive: true });
+    await fs.promises.writeFile(dest, content, 'utf8');
+    return { content: [{ type: 'text', text: `[${proj.alias}] Wrote ${content.length} bytes → ${dest}` }] };
+  }
+);
+
+// ── Discovery tool ────────────────────────────────────────────────
+
+server.tool(
+  'list_projects',
+  'List all configured projects (aliases, ids, slugs, labels). Use this to discover available projects.',
+  {},
+  async () => {
+    const projects = Object.entries(config.projects || {}).map(([alias, p]) => ({
+      alias,
+      id: p.id,
+      slug: p.slug,
+      label: p.label || alias,
+      isDefault: alias === config.defaultProject,
+    }));
+    return { content: [{ type: 'text', text: JSON.stringify(projects, null, 2) }] };
+  }
+);
+
+// ── File / revision tools ─────────────────────────────────────────
+
+server.tool(
+  'list_files',
+  'List all files (assets) in the project at a given revision.',
+  {
+    revision: z.number().int().describe('Project revision number to list assets from.'),
+    project: projectParam,
+  },
+  async ({ revision, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const res = await fetch(
+      `${API_BASE}/projects/${proj.id}/revisions/${revision}/assets`,
+      { headers: authHeaders(token) }
+    );
+    const text = await res.text();
+    if (!res.ok) throw new Error(`list_files failed (${res.status}): ${text}`);
+    const data = JSON.parse(text);
+    const files = (data.assets || []).map((a) => ({
+      path: a.path, size: a.size, content_type: a.content_type,
+    }));
+    return { content: [{ type: 'text', text: `[${proj.alias}] Revision ${revision}:\n${JSON.stringify(files, null, 2)}` }] };
+  }
+);
+
+server.tool(
+  'download_file',
+  'Download a file from the project into the local project/ folder.',
+  {
+    revision: z.number().int().describe('Project revision number to download from.'),
+    path: z.string().describe('File path within the project, e.g. "index.html".'),
+    project: projectParam,
+  },
+  async ({ revision, path, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const url = `https://${proj.id}.c.websim.com/${path}?v=${revision}&raw=`;
+    const res = await fetch(url, {
+      headers: {
+        accept: '*/*',
+        referer: `https://websim.com/p/${proj.id}/${revision}`,
+      },
+    });
+    if (!res.ok) throw new Error(`download failed (${res.status}): ${await res.text()}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    const dest = nodePath.join(PROJECT_DIR, proj.alias, path);
+    await fs.promises.mkdir(nodePath.dirname(dest), { recursive: true });
+    await fs.promises.writeFile(dest, buf);
+    // Return file contents so the LLM can edit them
+    const preview = buf.toString('utf8').slice(0, 8000);
+    const truncated = buf.length > 8000 ? '\n... [truncated, full file on disk]' : '';
+    return { content: [{ type: 'text', text: `[${proj.alias}] Downloaded ${path} (${buf.length} bytes)\n\nFILE CONTENTS:\n${preview}${truncated}` }] };
+  }
+);
+
+server.tool(
+  'upload_file',
+  'Upload a file from the local project/ folder to websim (create or replace).',
+  {
+    revision: z.number().int().describe('Project revision number to upload to.'),
+    path: z.string().describe('File path within the project, read from project/<alias>/<path>.'),
+    project: projectParam,
+  },
+  async ({ revision, path, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const src = nodePath.join(PROJECT_DIR, proj.alias, path);
+    let content;
+    try {
+      content = await fs.promises.readFile(src);
+    } catch {
+      throw new Error(`upload failed: local file not found at ${src} — download or create it first`);
+    }
+    const exists = await assetExists(proj.id, revision, path, token);
+    const out = await uploadAsset(proj.id, revision, path, content, token, exists);
+    return { content: [{ type: 'text', text: `[${proj.alias}] ${exists ? 'Replaced' : 'Created'} ${path} (${content.length} bytes)` }] };
+  }
+);
+
+server.tool(
+  'delete_file',
+  'Delete a file from the project at a given revision.',
+  {
+    revision: z.number().int().describe('Project revision number.'),
+    path: z.string().describe('File path to delete, e.g. "style.css".'),
+    project: projectParam,
+  },
+  async ({ revision, path, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const res = await fetch(
+      `${API_BASE}/projects/${proj.id}/revisions/${revision}/assets/${path}`,
+      { method: 'DELETE', headers: authHeaders(token) }
+    );
+    const text = await res.text();
+    if (!res.ok) throw new Error(`delete_file failed (${res.status}): ${text}`);
+    return { content: [{ type: 'text', text: `[${proj.alias}] Deleted ${path}` }] };
+  }
+);
+
+// ── Revision management ────────────────────────────────────────────
+
+server.tool(
+  'list_revisions',
+  'List all revisions of a project (version, id, draft state, name, title, created_at).',
+  { project: projectParam },
+  async ({ project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const res = await fetch(`${API_BASE}/projects/${proj.id}/revisions`, { headers: authHeaders(token) });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`list_revisions failed (${res.status}): ${text}`);
+    const data = JSON.parse(text);
+    const revs = (data.revisions?.data || []).map((r) => ({
+      version: r.project_revision?.version,
+      id: r.project_revision?.id,
+      draft: r.project_revision?.draft,
+      name: r.site?.prompt?.text || '',
+      title: r.site?.title || null,
+      created_at: r.project_revision?.created_at,
+    }));
+    return { content: [{ type: 'text', text: `[${proj.alias}] Revisions:\n${JSON.stringify(revs, null, 2)}` }] };
+  }
+);
+
+server.tool(
+  'create_revision',
+  'Create a new draft (editable) revision branched from an existing parent.',
+  {
+    parent_version: z.number().int().describe('The revision/version number to branch from.'),
+    project: projectParam,
+  },
+  async ({ parent_version, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const res = await fetch(
+      `${API_BASE}/projects/${proj.id}/revisions`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(token), 'content-type': 'application/json' },
+        body: JSON.stringify({ parent_version }),
+      }
+    );
+    const text = await res.text();
+    if (!res.ok) throw new Error(`create_revision failed (${res.status}): ${text}`);
+    let summary = text;
+    try {
+      const rev = JSON.parse(text).project_revision;
+      summary = `version=${rev.version}, draft=${rev.draft}, parent=${rev.parent_revision_version}`;
+    } catch {}
+    return { content: [{ type: 'text', text: `[${proj.alias}] Created revision: ${summary}` }] };
+  }
+);
+
+server.tool(
+  'finish_revision',
+  'Publish a revision by clearing its draft flag (makes it final/immutable).',
+  {
+    revision: z.number().int().describe('Project revision number to finish/publish.'),
+    project: projectParam,
+  },
+  async ({ revision, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const res = await fetch(
+      `${API_BASE}/projects/${proj.id}/revisions/${revision}`,
+      {
+        method: 'PATCH',
+        headers: { ...authHeaders(token), 'content-type': 'application/json' },
+        body: JSON.stringify({ draft: false }),
+      }
+    );
+    const text = await res.text();
+    if (!res.ok) throw new Error(`finish_revision failed (${res.status}): ${text}`);
+    let summary = text;
+    try {
+      const rev = JSON.parse(text).project_revision;
+      summary = `version=${rev.version}, draft=${rev.draft}`;
+    } catch {}
+    return { content: [{ type: 'text', text: `[${proj.alias}] Finished revision ${revision}: ${summary}` }] };
+  }
+);
+
+server.tool(
+  'set_current_revision',
+  'Set the live/published revision of the project.',
+  {
+    revision: z.number().int().describe('Revision/version number to make live.'),
+    project: projectParam,
+  },
+  async ({ revision, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const res = await fetch(
+      `${API_BASE}/projects/${proj.id}`,
+      {
+        method: 'PATCH',
+        headers: { ...authHeaders(token), 'content-type': 'application/json' },
+        body: JSON.stringify({ current_version: revision, auto_set_current: false }),
+      }
+    );
+    const text = await res.text();
+    if (!res.ok) throw new Error(`set_current_revision failed (${res.status}): ${text}`);
+    let summary = text;
+    try {
+      const p = JSON.parse(text).project ?? JSON.parse(text);
+      summary = `current_version=${p.current_version}`;
+    } catch {}
+    return { content: [{ type: 'text', text: `[${proj.alias}] Set current revision to ${revision}: ${summary}` }] };
+  }
+);
+
+server.tool(
+  'list_revision_history',
+  'List the edit history for a given revision.',
+  {
+    revision: z.number().int().describe('Revision number.'),
+    project: projectParam,
+  },
+  async ({ revision, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const token = getBearer(proj);
+    const res = await fetch(
+      `${API_BASE}/projects/${proj.id}/revisions/${revision}/edit-history`,
+      { headers: authHeaders(token) }
+    );
+    const text = await res.text();
+    if (!res.ok) throw new Error(`list_revision_history failed (${res.status}): ${text}`);
+    const data = JSON.parse(text);
+    const edits = (data.edits || []).map((e) => ({
+      id: e.id, at: e.created_at,
+      op: e.data?.type ?? 'edit',
+      path: e.data?.path ?? e.new_path ?? e.old_path,
+      by: e.by,
+    }));
+    return { content: [{ type: 'text', text: `[${proj.alias}] Edit history:\n${JSON.stringify(edits, null, 2)}` }] };
+  }
+);
+
+// ── Comment tools ──────────────────────────────────────────────────
+
+const { postComment, postReply, deleteComment, listComments, listCommentReplies } = require('./websim-comment.js');
+
+server.tool(
+  'list_comments',
+  'List top-level comments on the project.',
+  {
+    limit: z.number().int().optional().describe('Max comments (default 20).'),
+    project: projectParam,
+  },
+  async ({ limit, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const comments = await listComments(limit ?? 20, proj.id, proj.slug, getBearer(proj));
+    return { content: [{ type: 'text', text: JSON.stringify({ project: proj.alias, comments }) }] };
+  }
+);
+
+server.tool(
+  'list_comment_replies',
+  'List replies to a specific comment.',
+  {
+    comment_id: z.string().describe('Parent comment id.'),
+    limit: z.number().int().optional().describe('Max replies (default 20).'),
+    project: projectParam,
+  },
+  async ({ comment_id, limit, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const replies = await listCommentReplies(comment_id, limit ?? 20, proj.id, proj.slug, getBearer(proj));
+    return { content: [{ type: 'text', text: `[${proj.alias}] Replies to ${comment_id}:\n${JSON.stringify(replies, null, 2)}` }] };
+  }
+);
+
+server.tool(
+  'post_comment',
+  'Post a new top-level comment on the project.',
+  {
+    content: z.string().describe('Comment text to post.'),
+    project: projectParam,
+  },
+  async ({ content, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const out = await postComment(content, proj.id, proj.slug, getBearer(proj));
+    return { content: [{ type: 'text', text: `[${proj.alias}] Posted comment: ${out}` }] };
+  }
+);
+
+server.tool(
+  'post_reply',
+  'Reply to an existing comment.',
+  {
+    comment_id: z.string().describe('Parent comment id.'),
+    content: z.string().describe('Reply text.'),
+    project: projectParam,
+  },
+  async ({ comment_id, content, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const out = await postReply(comment_id, content, proj.id, proj.slug, getBearer(proj));
+    return { content: [{ type: 'text', text: `[${proj.alias}] Replied to ${comment_id}: ${out}` }] };
+  }
+);
+
+server.tool(
+  'delete_comment',
+  'Delete a comment by id.',
+  {
+    comment_id: z.string().describe('Comment id to delete.'),
+    project: projectParam,
+  },
+  async ({ comment_id, project: projectAlias }) => {
+    const proj = getProject(projectAlias);
+    const out = await deleteComment(comment_id, proj.id, proj.slug, getBearer(proj));
+    return { content: [{ type: 'text', text: `[${proj.alias}] Deleted comment ${comment_id}: ${out}` }] };
+  }
+);
+
+// ── Boot ───────────────────────────────────────────────────────────
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(`[mcp] websim-multi-project v2 running on stdio (${Object.keys(config.projects || {}).length} projects)`);
+}
+
+main().catch((err) => {
+  console.error('[mcp] Fatal:', err);
+  process.exit(1);
+});
