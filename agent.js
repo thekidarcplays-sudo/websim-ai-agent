@@ -229,12 +229,28 @@ async function executeToolCall(toolCall) {
   }
 }
 
+// ── CLAUDE.md loader (agent's own guide) ───────────────────────────
+
+let _claudeGuide = '';
+function loadClaudeGuide() {
+  if (_claudeGuide) return _claudeGuide;
+  try {
+    _claudeGuide = fs.readFileSync(nodePath.join(__dirname, 'CLAUDE.md'), 'utf8');
+    log('Loaded CLAUDE.md guide');
+  } catch { _claudeGuide = ''; }
+  return _claudeGuide;
+}
+
+// ── Agent loop ─────────────────────────────────────────────────────
+
 async function runAgent(prompt, projectAlias) {
   // Native OpenAI function-calling: hand the model the real tool schemas and
   // execute the tool_calls it returns. Returns { ok, summary, edited } so the
   // caller (e.g. the comment bot) can tell whether an edit ACTUALLY happened
   // instead of trusting the model's prose.
   const tools = mcpTools.map(mcpToolToOpenAI);
+  const guide = loadClaudeGuide();
+  const guideSection = guide ? `\n\nGUIDE (from CLAUDE.md):\n${guide.slice(0, 3000)}\n` : '';
   const messages = [
     {
       role: 'system',
@@ -250,7 +266,7 @@ WORKFLOW:
 7. set_current_revision → make it live
 Then stop (no more tool calls) and give a 1-2 sentence summary of what you changed.
 
-Default project alias: "${projectAlias || 'default'}". Always start with list_revisions.`,
+Default project alias: "${projectAlias || 'default'}". Always start with list_revisions.${guideSection}`,
     },
     { role: 'user', content: `TASK: ${prompt}` },
   ];
@@ -456,16 +472,10 @@ YOUR JOB:
 3. Write a friendly reply explaining your decision
 4. Write a precise editPrompt that another agent can execute
 
-PROJECT CONTEXT:
-- This is a simple platformer game with a player, enemies, coins, platforms
-- Files: index.html (structure), app.js (game logic)
-- You can add features, fix bugs, change visuals, add content
-- The game currently has: player movement, jumping, coins, enemies, platforms, qblocks, domar counter
-
 REASONING GUIDELINES:
-- Good requests: new game mechanics, visual improvements, sounds, UI, levels, powerups, effects
+- Good requests: new features, visual improvements, sounds, UI, content, mechanics
 - Bad requests (reply politely why): impossible features, NSFW, harmful, extremely vague, spam/ads/links
-- Vague requests: interpret generously! "make it cooler" → add particle effects or screen shake
+- Vague requests: interpret generously! "make it cooler" → add effects or polish
 - Slop/spam: ads, crypto, gibberish, link-only comments → reject
 - Greetings: welcome them and ask what they'd like built
 
@@ -478,6 +488,15 @@ RESPONSE FORMAT (JSON only, no markdown):
   "editPrompt": "if actionable: precise editing instructions with specific implementation details",
   "tags": ["keywords"]
 }`;
+
+// Cached combined triage prompt (includes CLAUDE.md guide for project context)
+let _cachedTriagePrompt = '';
+function getTriagePrompt() {
+  if (_cachedTriagePrompt) return _cachedTriagePrompt;
+  const guide = loadClaudeGuide();
+  _cachedTriagePrompt = guide ? `${TRIAGE_SYSTEM_PROMPT}\n\nPROJECT CONTEXT (from CLAUDE.md):\n${guide.slice(0, 3000)}` : TRIAGE_SYSTEM_PROMPT;
+  return _cachedTriagePrompt;
+}
 
 async function triageComment(comment, state) {
   const content = extractCommentText(comment);
@@ -498,7 +517,7 @@ async function triageComment(comment, state) {
     : '';
 
   const res = await callModel([
-    { role: 'system', content: TRIAGE_SYSTEM_PROMPT },
+    { role: 'system', content: getTriagePrompt() },
     { role: 'user', content: `Comment from @${author}: ${content}${memorySection}` },
   ]);
 
