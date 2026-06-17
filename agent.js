@@ -261,6 +261,7 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
   // Track whether a real mutating tool actually ran — this is the anti-hallucination guard.
   const MUTATING = new Set(['upload_file', 'finish_revision', 'set_current_revision', 'delete_file', 'create_revision']);
   let edited = false;
+  let published = false; // specifically: did finish_revision get called?
 
   for (let turn = 0; turn < CONFIG.maxTurns; turn++) {
     const response = await callModel(messages, tools);
@@ -271,6 +272,12 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
 
     // No tool calls => the model is done (or stalled). Either way, stop the loop.
     if (toolCalls.length === 0) {
+      // If we uploaded files but didn't publish, nudge the LLM
+      if (edited && !published) {
+        console.log('   ⚠️ Files uploaded but NOT published — prompting to finish.');
+        messages.push({ role: 'user', content: 'You uploaded files but did NOT call finish_revision or set_current_revision. The changes are NOT live! Call finish_revision and set_current_revision NOW.' });
+        continue;
+      }
       const summary = (msg.content || '').trim();
       if (summary) console.log(summary.slice(0, 400));
       // Push the assistant turn so the transcript is coherent, then finish.
@@ -296,6 +303,7 @@ Default project alias: "${projectAlias || 'default'}". Always start with list_re
         const res = await mcpClient.callTool({ name, arguments: args });
         result = res.content.filter(c => c.type === 'text').map(c => c.text).join('\n') || '(ok)';
         if (MUTATING.has(name)) edited = true;
+      if (name === 'finish_revision') published = true;
         console.log(`   ↳ ${result.slice(0, 200)}`);
       } catch (err) {
         result = `Error: ${err.message}`;
